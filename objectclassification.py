@@ -175,3 +175,182 @@ def train(opt, device):
     if cuda and RANK != -1:
         model = smart_DDP(model)
 
+    # Train
+    t0 = time.time()
+    criterion = smartCrossEntropyLoss(label_smoothing=opt.label_smoothing)  # loss function
+    best_fitness = 0.0
+    scaler = amp.GradScaler(enabled=cuda)
+    val = test_dir.stem  # 'val' or 'test'
+    LOGGER.info(
+        f'Image sizes {imgsz} train, {imgsz} test\n'
+        f'Using {nw * WORLD_SIZE} dataloader workers\n'
+        f"Logging results to {colorstr('bold', save_dir)}\n"
+        f'Starting {opt.model} training on {data} dataset with {nc} classes for {epochs} epochs...\n\n'
+        f"{'Epoch':>10}{'GPU_mem':>10}{'train_loss':>12}{f'{val}_loss':>12}{'top1_acc':>12}{'top5_acc':>12}"
+    )
+    for epoch in range(epochs):  # loop over the dataset multiple times
+        tloss, vloss, fitness = 0.0, 0.0, 0.0  # train loss, val loss, fitness
+        model.train()
+        if RANK != -1:
+            trainloader.sampler.set_epoch(epoch)
+        pbar = enumerate(trainloader)
+        if RANK in {-1, 0}:
+            pbar = tqdm(enumerate(trainloader), total=len(trainloader), bar_format=TQDM_BAR_FORMAT)
+        for i, (images, labels) in pbar:  # progress bar
+            images, labels = images.to(device, non_blocking=True), labels.to(device)
+
+            # Forward
+            with amp.autocast(enabled=cuda):  # stability issues when enabled
+                loss = criterion(model(images), labels)
+
+            # Backward
+            scaler.scale(loss).backward()
+
+            # Optimize
+            scaler.unscale_(optimizer)  # unscale gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            if ema:
+                ema.update(model)
+
+            if RANK in {-1, 0}:
+                # Print
+                tloss = (tloss * i + loss.item()) / (i + 1)  # update mean losses
+                mem = "%.3gG" % (torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0)  # (GB)
+                pbar.desc = f"{f'{epoch + 1}/{epochs}':>10}{mem:>10}{tloss:>12.3g}" + " " * 36
+
+                # Test
+                if i == len(pbar) - 1:  # last batch
+                    top1, top5, vloss = validate.run(
+                        model=ema.ema, dataloader=testloader, criterion=criterion, pbar=pbar
+                    )  # test accuracy, loss
+                    fitness = top1  # define fitness as top1 accuracy
+
+        # Scheduler
+        scheduler.step()
+
+        # Log metrics
+        if RANK in {-1, 0}:
+            # Best fitness
+            if fitness > best_fitness:
+                best_fitness = fitness
+
+            # Log
+            metrics = {
+                "train/loss": tloss,
+                f"{val}/loss": vloss,
+                "metrics/accuracy_top1": top1,
+                "metrics/accuracy_top5": top5,
+                "lr/0": optimizer.param_groups[0]["lr"],
+            }  # learning rate
+            logger.log_metrics(metrics, epoch)
+
+            # Save model
+            final_epoch = epoch + 1 == epochs
+            if (not opt.nosave) or final_epoch:
+                ckpt = {
+                    "epoch": epoch,
+                    "best_fitness": best_fitness,
+                    "model": deepcopy(ema.ema).half(),  # deepcopy(de_parallel(model)).half(),
+                    "ema": None,  # deepcopy(ema.ema).half(),
+                    "updates": ema.updates,
+                    "optimizer": None,  # optimizer.state_dict(),
+                    "opt": vars(opt),
+                    "git": GIT_INFO,  # {remote, branch, commit} if a git repo
+                    "date": datetime.now().isoformat(),
+                }
+
+                # Save last, best and delete
+                torch.save(ckpt, last)
+                if best_fitness == fitness:
+                    torch.save(ckpt, best)
+                del ckpt
+
+    # Train complete
+    if RANK in {-1, 0} and final_epoch:
+        LOGGER.info(
+            f'\nTraining complete ({(time.time() - t0) / 3600:.3f} hours)'
+            f"\nResults saved to {colorstr('bold', save_dir)}"
+            f'\nPredict:         python classify/predict.py --weights {best} --source im.jpg'
+            f'\nValidate:        python classify/val.py --weights {best} --data {data_dir}'
+            f'\nExport:          python export.py --weights {best} --include onnx'
+            f"\nPyTorch Hub:     model = torch.hub.load('ultralytics/yolov5', 'custom', '{best}')"
+            f'\nVisualize:       https://netron.app\n'
+        )
+
+        # Plot examples
+        images, labels = (x[:25] for x in next(iter(testloader)))  # first 25 images and labels
+        pred = torch.max(ema.ema(images.to(device)), 1)[1]
+        file = imshow_cls(images, labels, pred, de_parallel(model).names, verbose=False, f=save_dir / "test_images.jpg")
+
+        # Log results
+        meta = {"epochs": epochs, "top1_acc": best_fitness, "date": datetime.now().isoformat()}
+        logger.log_images(file, name="Test Examples (true-predicted)", epoch=epoch)
+        logger.log_model(best, epochs, metadata=meta)
+
+
+def parse_opt(known=False):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default="yolov5s-cls.pt", help="initial weights path")
+    parser.add_argument("--data", type=str, default="imagenette160", help="cifar10, cifar100, mnist, imagenet, ...")
+    parser.add_argument("--epochs", type=int, default=10, help="total training epochs")
+    parser.add_argument("--batch-size", type=int, default=64, help="total batch size for all GPUs")
+    parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=224, help="train, val image size (pixels)")
+    parser.add_argument("--nosave", action="store_true", help="only save final checkpoint")
+    parser.add_argument("--cache", type=str, nargs="?", const="ram", help='--cache images in "ram" (default) or "disk"')
+    parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
+    parser.add_argument("--workers", type=int, default=8, help="max dataloader workers (per RANK in DDP mode)")
+    parser.add_argument("--project", default=ROOT / "runs/train-cls", help="save to project/name")
+    parser.add_argument("--name", default="exp", help="save to project/name")
+    parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
+    parser.add_argument("--pretrained", nargs="?", const=True, default=True, help="start from i.e. --pretrained False")
+    parser.add_argument("--optimizer", choices=["SGD", "Adam", "AdamW", "RMSProp"], default="Adam", help="optimizer")
+    parser.add_argument("--lr0", type=float, default=0.001, help="initial learning rate")
+    parser.add_argument("--decay", type=float, default=5e-5, help="weight decay")
+    parser.add_argument("--label-smoothing", type=float, default=0.1, help="Label smoothing epsilon")
+    parser.add_argument("--cutoff", type=int, default=None, help="Model layer cutoff index for Classify() head")
+    parser.add_argument("--dropout", type=float, default=None, help="Dropout (fraction)")
+    parser.add_argument("--verbose", action="store_true", help="Verbose mode")
+    parser.add_argument("--seed", type=int, default=0, help="Global training seed")
+    parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")
+    return parser.parse_known_args()[0] if known else parser.parse_args()
+
+
+def main(opt):
+    # Checks
+    if RANK in {-1, 0}:
+        print_args(vars(opt))
+        check_git_status()
+        check_requirements(ROOT / "requirements.txt")
+
+    # DDP mode
+    device = select_device(opt.device, batch_size=opt.batch_size)
+    if LOCAL_RANK != -1:
+        assert opt.batch_size != -1, "AutoBatch is coming soon for classification, please pass a valid --batch-size"
+        assert opt.batch_size % WORLD_SIZE == 0, f"--batch-size {opt.batch_size} must be multiple of WORLD_SIZE"
+        assert torch.cuda.device_count() > LOCAL_RANK, "insufficient CUDA devices for DDP command"
+        torch.cuda.set_device(LOCAL_RANK)
+        device = torch.device("cuda", LOCAL_RANK)
+        dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo")
+
+    # Parameters
+    opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok)  # increment run
+
+    # Train
+    train(opt, device)
+
+
+def run(**kwargs):
+    # Usage: from yolov5 import classify; classify.train.run(data=mnist, imgsz=320, model='yolov5m')
+    opt = parse_opt(True)
+    for k, v in kwargs.items():
+        setattr(opt, k, v)
+    main(opt)
+    return opt
+
+
+if __name__ == "__main__":
+    opt = parse_opt()
+    main(opt)
